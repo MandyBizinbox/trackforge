@@ -70,25 +70,167 @@ class BookingController extends Controller
         return $booking->fresh('items.equipment');
     }
     public function notifyLogistics(Booking $booking, NotificationService $notifier){ $this->sendLogisticsNotifications($booking,$notifier); return response()->json(['message'=>'Logistics notifications sent']); }
+    /**
+     * Issue approved equipment. The payload quantities represent the FINAL cumulative
+     * number issued for each booking item. An item can be issued only once.
+     */
     public function issue(Request $request, Booking $booking, NotificationService $notifier)
     {
-        $data=$request->validate(['items'=>'required|array','items.*.booking_item_id'=>'required|exists:booking_items,id','items.*.quantity_issued'=>'required|integer|min:0','items.*.issue_condition'=>'nullable|string','items.*.issue_notes'=>'nullable|string']);
-        DB::transaction(function() use($request,$booking,$data){
-            foreach($data['items'] as $row){ $bi=BookingItem::findOrFail($row['booking_item_id']); $bi->update(['quantity_issued'=>$row['quantity_issued'],'issue_condition'=>$row['issue_condition']??null,'issue_notes'=>$row['issue_notes']??null,'status'=>'issued']); EquipmentMovement::create(['equipment_item_id'=>$bi->equipment_item_id,'booking_id'=>$booking->id,'user_id'=>$request->user()->id,'movement_type'=>'issued','quantity'=>$row['quantity_issued'],'notes'=>$row['issue_notes']??null]); $bi->equipment()->update(['availability_status'=>'checked_out']); }
-            $booking->update(['status'=>'checked_out']);
-        });
+        $data = $request->validate([
+            'items' => 'required|array|min:1',
+            'items.*.booking_item_id' => 'required|integer|distinct|exists:booking_items,id',
+            'items.*.quantity_issued' => 'required|integer|min:0',
+            'items.*.issue_condition' => 'nullable|in:good,fair,poor,damaged',
+            'items.*.issue_notes' => 'nullable|string',
+        ]);
+
+        DB::transaction(function () use ($request, $booking, $data) {
+            $lockedBooking = Booking::whereKey($booking->id)->lockForUpdate()->firstOrFail();
+            $this->assertUnit($request, $lockedBooking);
+            abort_unless(in_array($lockedBooking->status, ['approved', 'ready_for_collection'], true), 409, 'Booking must be approved before issuing.');
+
+            $bookingItems = $lockedBooking->items()->lockForUpdate()->get()->keyBy('id');
+            $submitted = collect($data['items'])->keyBy('booking_item_id');
+            abort_unless($submitted->count() === $bookingItems->count(), 422, 'Include every booking item when issuing equipment.');
+
+            // Lock inventory in a consistent order to reduce deadlock risk.
+            $equipment = EquipmentItem::whereIn('id', $bookingItems->pluck('equipment_item_id'))
+                ->orderBy('id')->lockForUpdate()->get()->keyBy('id');
+
+            $totalIssued = 0;
+            foreach ($bookingItems as $bi) {
+                $row = $submitted->get($bi->id);
+                abort_unless($row !== null, 422, 'Missing booking item.');
+                abort_unless((int) $bi->quantity_issued === 0 && (int) $bi->quantity_returned === 0, 409, 'Equipment has already been issued.');
+                $qty = (int) $row['quantity_issued'];
+                abort_unless($qty <= (int) $bi->quantity_approved, 422, 'Cannot issue more than approved.');
+                $item = $equipment->get($bi->equipment_item_id);
+                abort_unless($item !== null && (int) $item->unit_id === (int) $lockedBooking->unit_id, 403);
+                abort_unless(!in_array($item->availability_status, ['maintenance','lost','written_off'], true), 409, 'Equipment is unavailable.');
+                abort_unless($qty <= (int) $item->quantity_available, 409, 'Insufficient stock for '.$item->asset_code);
+                $totalIssued += $qty;
+            }
+            abort_unless($totalIssued > 0, 422, 'Issue at least one item.');
+
+            foreach ($bookingItems as $bi) {
+                $row = $submitted->get($bi->id);
+                $qty = (int) $row['quantity_issued'];
+                $item = $equipment->get($bi->equipment_item_id);
+                $bi->update([
+                    'quantity_issued' => $qty,
+                    'issue_condition' => $row['issue_condition'] ?? 'good',
+                    'issue_notes' => $row['issue_notes'] ?? null,
+                    'status' => $qty > 0 ? 'issued' : 'approved',
+                ]);
+                if ($qty === 0) continue;
+                $item->quantity_available -= $qty;
+                $item->availability_status = $item->quantity_available === 0 ? 'checked_out' : 'available';
+                $item->save();
+                EquipmentMovement::create([
+                    'equipment_item_id' => $item->id,
+                    'booking_id' => $lockedBooking->id,
+                    'user_id' => $request->user()->id,
+                    'movement_type' => 'issued',
+                    'quantity' => $qty,
+                    'condition_before' => $item->condition_status,
+                    'notes' => $row['issue_notes'] ?? null,
+                ]);
+            }
+
+            $lockedBooking->update(['status' => 'checked_out']);
+        }, 3);
+
         $notifier->sendToUser($booking->requester,'equipment_checked_out','Equipment Checked Out',"Equipment for '{$booking->title}' has been checked out.","/bookings/{$booking->id}",['booking_id'=>$booking->id]);
         return $booking->fresh('items.equipment');
     }
+
+    /**
+     * Returns are cumulative totals, not increments. Repeating the same submission
+     * changes nothing. Damaged returns are quarantined and do not increase availability.
+     */
     public function returnItems(Request $request, Booking $booking, NotificationService $notifier)
     {
-        $data=$request->validate(['items'=>'required|array','items.*.booking_item_id'=>'required|exists:booking_items,id','items.*.quantity_returned'=>'required|integer|min:0','items.*.return_condition'=>'nullable|string','items.*.return_notes'=>'nullable|string']);
-        DB::transaction(function() use($request,$booking,$data){
-            foreach($data['items'] as $row){ $bi=BookingItem::findOrFail($row['booking_item_id']); $bi->update(['quantity_returned'=>$row['quantity_returned'],'return_condition'=>$row['return_condition']??null,'return_notes'=>$row['return_notes']??null,'status'=>'returned']); EquipmentMovement::create(['equipment_item_id'=>$bi->equipment_item_id,'booking_id'=>$booking->id,'user_id'=>$request->user()->id,'movement_type'=>'returned','quantity'=>$row['quantity_returned'],'notes'=>$row['return_notes']??null]); $bi->equipment()->update(['availability_status'=>($row['return_condition']??'good')==='damaged'?'maintenance':'available']); }
-            $booking->update(['status'=>'returned']);
-        });
-        $notifier->sendToUser($booking->requester,'equipment_returned','Equipment Returned',"Equipment for '{$booking->title}' has been returned and recorded.","/bookings/{$booking->id}",['booking_id'=>$booking->id]);
+        $data = $request->validate([
+            'items' => 'required|array|min:1',
+            'items.*.booking_item_id' => 'required|integer|distinct|exists:booking_items,id',
+            'items.*.quantity_returned' => 'required|integer|min:0',
+            'items.*.return_condition' => 'nullable|in:good,fair,poor,damaged',
+            'items.*.return_notes' => 'nullable|string',
+        ]);
+
+        $fullyReturned = DB::transaction(function () use ($request, $booking, $data) {
+            $lockedBooking = Booking::whereKey($booking->id)->lockForUpdate()->firstOrFail();
+            $this->assertUnit($request, $lockedBooking);
+            abort_unless($lockedBooking->status === 'checked_out', 409, 'Booking is not checked out.');
+
+            $bookingItems = $lockedBooking->items()->lockForUpdate()->get()->keyBy('id');
+            $submitted = collect($data['items'])->keyBy('booking_item_id');
+            abort_unless($submitted->count() === $bookingItems->count(), 422, 'Include every booking item when returning equipment.');
+
+            $equipment = EquipmentItem::whereIn('id', $bookingItems->pluck('equipment_item_id'))
+                ->orderBy('id')->lockForUpdate()->get()->keyBy('id');
+
+            foreach ($bookingItems as $bi) {
+                $row = $submitted->get($bi->id);
+                abort_unless($row !== null, 422, 'Missing booking item.');
+                $cumulative = (int) $row['quantity_returned'];
+                abort_unless($cumulative >= (int) $bi->quantity_returned, 422, 'Returned quantity cannot decrease.');
+                abort_unless($cumulative <= (int) $bi->quantity_issued, 422, 'Cannot return more than issued.');
+                abort_unless($equipment->has($bi->equipment_item_id), 404);
+            }
+
+            foreach ($bookingItems as $bi) {
+                $row = $submitted->get($bi->id);
+                $cumulative = (int) $row['quantity_returned'];
+                $delta = $cumulative - (int) $bi->quantity_returned;
+                if ($delta === 0) continue;
+                $item = $equipment->get($bi->equipment_item_id);
+                $condition = $row['return_condition'] ?? 'good';
+                $damaged = $condition === 'damaged';
+                $bi->update([
+                    'quantity_returned' => $cumulative,
+                    'return_condition' => $condition,
+                    'return_notes' => $row['return_notes'] ?? null,
+                    'status' => $cumulative === (int) $bi->quantity_issued ? 'returned' : 'issued',
+                ]);
+                if ($damaged) {
+                    $item->condition_status = 'damaged';
+                    $item->availability_status = 'maintenance';
+                } else {
+                    $item->quantity_available += $delta;
+                    abort_unless($item->quantity_available <= $item->quantity_total, 409, 'Inventory quantity exceeds total.');
+                    if (!in_array($item->availability_status, ['maintenance','lost','written_off'], true)) {
+                        $item->availability_status = 'available';
+                    }
+                }
+                $item->save();
+                EquipmentMovement::create([
+                    'equipment_item_id' => $item->id,
+                    'booking_id' => $lockedBooking->id,
+                    'user_id' => $request->user()->id,
+                    'movement_type' => $damaged ? 'returned_damaged' : 'returned',
+                    'quantity' => $delta,
+                    'condition_before' => $bi->issue_condition,
+                    'condition_after' => $condition,
+                    'notes' => $row['return_notes'] ?? null,
+                ]);
+            }
+            $complete = $bookingItems->every(fn($bi) =>
+                (int) $bi->fresh()->quantity_returned === (int) $bi->quantity_issued
+            );
+            if ($complete) $lockedBooking->update(['status' => 'returned']);
+            return $complete;
+        }, 3);
+
+        if ($fullyReturned) {
+            $notifier->sendToUser($booking->requester,'equipment_returned','Equipment Returned',"Equipment for '{$booking->title}' has been returned and recorded.","/bookings/{$booking->id}",['booking_id'=>$booking->id]);
+        }
         return $booking->fresh('items.equipment');
+    }
+
+    private function assertUnit(Request $request, Booking $booking): void
+    {
+        abort_unless((int) $booking->unit_id === (int) $request->user()->unit_id, 403);
     }
     private function sendLogisticsNotifications(Booking $booking, NotificationService $notifier): void
     {
