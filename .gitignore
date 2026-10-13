@@ -1,0 +1,40 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Dependencies
+**/vendor/
+**/node_modules/
+
+# Build and deployment
+frontend/dist/
+/app/
+backups/
+*.zip
+*.tar.gz
+
+# Laravel runtime
+**/storage/
+**/bootstrap/cache/*
+!**/bootstrap/cache/.gitignore
+
+# Databases and exports
+*.sql
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+npm-debug.log*
+
+# Laravel public storage symlink
+backend/public/storage
+
+# Local tools and editor files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
