@@ -47,8 +47,44 @@ class BookingController extends Controller
     public function submit(Booking $booking){ $booking->update(['status'=>'submitted']); return $booking; }
     public function approve(Request $request, Booking $booking, NotificationService $notifier)
     {
-        foreach($booking->items as $item){ $item->update(['quantity_approved'=>$item->quantity_requested,'status'=>'approved']); }
-        $booking->update(['status'=>'approved','approved_by_user_id'=>$request->user()->id,'approved_at'=>now()]);
+        DB::transaction(function () use ($request, $booking) {
+            $lockedBooking = Booking::whereKey($booking->id)->lockForUpdate()->firstOrFail();
+            $this->assertUnit($request, $lockedBooking);
+            abort_unless($lockedBooking->status === 'submitted', 409, 'Only submitted bookings can be approved.');
+            $items = $lockedBooking->items()->lockForUpdate()->get();
+            abort_unless($items->isNotEmpty(), 422, 'Booking has no equipment.');
+            abort_unless($items->pluck('equipment_item_id')->unique()->count() === $items->count(), 422, 'Duplicate equipment lines are not supported.');
+
+            $equipment = EquipmentItem::whereIn('id', $items->pluck('equipment_item_id'))
+                ->orderBy('id')->lockForUpdate()->get()->keyBy('id');
+
+            foreach ($items as $bi) {
+                $item = $equipment->get($bi->equipment_item_id);
+                abort_unless($item && (int) $item->unit_id === (int) $lockedBooking->unit_id, 403);
+                abort_unless(!in_array($item->availability_status, ['maintenance','lost','written_off'], true), 409, 'Equipment unavailable.');
+                $reserved = BookingItem::query()
+                    ->where('equipment_item_id', $item->id)
+                    ->where('booking_id', '!=', $lockedBooking->id)
+                    ->whereHas('booking', fn ($query) => $query
+                        ->whereIn('status', ['approved','ready_for_collection'])
+                        ->whereDate('start_date', '<=', $lockedBooking->end_date)
+                        ->whereDate('end_date', '>=', $lockedBooking->start_date))
+                    ->sum('quantity_approved');
+                // Checked-out stock is already deducted from quantity_available.
+                $available = max(0, (int) $item->quantity_available - (int) $reserved);
+                abort_unless((int) $bi->quantity_requested <= $available, 409, 'Insufficient availability for '.$item->asset_code);
+            }
+
+            foreach ($items as $bi) {
+                $bi->update(['quantity_approved' => $bi->quantity_requested, 'status' => 'approved']);
+            }
+            $lockedBooking->update([
+                'status' => 'approved',
+                'approved_by_user_id' => $request->user()->id,
+                'approved_at' => now(),
+            ]);
+        }, 3);
+
         $notifier->sendToUser($booking->requester,'booking_approved','Booking Approved',"Your booking '{$booking->title}' has been approved. The QM will confirm collection and return details.","/bookings/{$booking->id}",['booking_id'=>$booking->id]);
         return $booking->fresh('items.equipment');
     }
