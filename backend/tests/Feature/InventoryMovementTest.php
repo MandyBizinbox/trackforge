@@ -155,4 +155,40 @@ class InventoryMovementTest extends TestCase
         $this->actingAs($this->qm)->deleteJson("/api/bookings/{$booking->id}")->assertStatus(409);
         $this->assertSame('checked_out', $booking->fresh()->status);
     }
+    public function test_mixed_bulk_return_quarantines_only_damaged_units(): void
+    {
+        $booking = $this->booking(20, 'approved');
+        $line = $booking->items()->first();
+
+        $this->actingAs($this->qm)->postJson("/api/bookings/{$booking->id}/issue", [
+            'items' => [['booking_item_id' => $line->id, 'quantity_issued' => 20]],
+        ])->assertOk();
+
+        $mixed = ['items' => [[
+            'booking_item_id' => $line->id,
+            'quantity_returned' => 12,
+            'quantity_damaged' => 3,
+            'return_condition' => 'fair',
+        ]]];
+        $this->actingAs($this->qm)->postJson("/api/bookings/{$booking->id}/return", $mixed)->assertOk();
+        $this->assertSame(89, (int) $this->ropes->fresh()->quantity_available);
+        $this->assertSame(3, (int) $this->ropes->fresh()->quantity_quarantined);
+        $this->assertSame('available', $this->ropes->fresh()->availability_status);
+
+        $this->actingAs($this->qm)->postJson("/api/bookings/{$booking->id}/return", $mixed)->assertOk();
+        $this->assertSame(89, (int) $this->ropes->fresh()->quantity_available);
+        $this->assertSame(3, (int) $this->ropes->fresh()->quantity_quarantined);
+
+        $this->actingAs($this->qm)->postJson("/api/bookings/{$booking->id}/return", [
+            'items' => [[
+                'booking_item_id' => $line->id,
+                'quantity_returned' => 20,
+                'quantity_damaged' => 3,
+                'return_condition' => 'good',
+            ]],
+        ])->assertOk();
+        $this->assertSame(97, (int) $this->ropes->fresh()->quantity_available);
+        $this->assertSame(3, (int) $this->ropes->fresh()->quantity_quarantined);
+    }
+
 }
