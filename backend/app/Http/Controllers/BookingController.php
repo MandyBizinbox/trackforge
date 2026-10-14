@@ -229,6 +229,7 @@ class BookingController extends Controller
             'items.*.booking_item_id' => 'required|integer|distinct|exists:booking_items,id',
             'items.*.quantity_returned' => 'required|integer|min:0',
             'items.*.return_condition' => 'nullable|in:good,fair,poor,damaged',
+            'items.*.quantity_damaged' => 'sometimes|integer|min:0',
             'items.*.return_notes' => 'nullable|string',
         ]);
 
@@ -250,6 +251,9 @@ class BookingController extends Controller
                 $cumulative = (int) $row['quantity_returned'];
                 abort_unless($cumulative >= (int) $bi->quantity_returned, 422, 'Returned quantity cannot decrease.');
                 abort_unless($cumulative <= (int) $bi->quantity_issued, 422, 'Cannot return more than issued.');
+                $cumulativeDamaged = (int) ($row['quantity_damaged'] ?? ($row['return_condition'] ?? null) === 'damaged' ? $cumulative : (int) $bi->quantity_damaged);
+                abort_unless($cumulativeDamaged >= (int) $bi->quantity_damaged && $cumulativeDamaged <= $cumulative, 422, 'Invalid damaged quantity.');
+                abort_unless($cumulativeDamaged - (int) $bi->quantity_damaged <= $cumulative - (int) $bi->quantity_returned, 422, 'Invalid damaged return increment.');
                 $item = $equipment->get($bi->equipment_item_id);
                 abort_unless($item !== null && (int) $item->unit_id === (int) $lockedBooking->unit_id, 403);
             }
@@ -261,33 +265,37 @@ class BookingController extends Controller
                 if ($delta === 0) continue;
                 $item = $equipment->get($bi->equipment_item_id);
                 $condition = $row['return_condition'] ?? 'good';
-                $damaged = $condition === 'damaged';
+                $cumulativeDamaged = (int) ($row['quantity_damaged'] ?? ($condition === 'damaged' ? $cumulative : (int) $bi->quantity_damaged));
+                $newDamaged = $cumulativeDamaged - (int) $bi->quantity_damaged;
+                $usable = $delta - $newDamaged;
                 $bi->update([
                     'quantity_returned' => $cumulative,
+                    'quantity_damaged' => $cumulativeDamaged,
                     'return_condition' => $condition,
                     'return_notes' => $row['return_notes'] ?? null,
                     'status' => $cumulative === (int) $bi->quantity_issued ? 'returned' : 'issued',
                 ]);
-                if ($damaged) {
+                $item->quantity_available += $usable;
+                $item->quantity_quarantined += $newDamaged;
+                abort_unless($item->quantity_available >= 0
+                    && $item->quantity_quarantined >= 0
+                    && $item->quantity_available + $item->quantity_quarantined <= $item->quantity_total, 409, 'Invalid stock reconciliation.');
+                if ($item->tracking_type === 'individual' && $newDamaged > 0) {
                     $item->condition_status = 'damaged';
                     $item->availability_status = 'maintenance';
-                } else {
-                    $item->quantity_available += $delta;
-                    abort_unless($item->quantity_available <= $item->quantity_total, 409, 'Inventory quantity exceeds total.');
-                    if (!in_array($item->availability_status, ['maintenance','lost','written_off'], true)) {
-                        $item->availability_status = 'available';
-                    }
+                } elseif (!in_array($item->availability_status, ['maintenance', 'lost', 'written_off'], true)) {
+                    $item->availability_status = $item->quantity_available > 0 ? 'available' : 'checked_out';
                 }
                 $item->save();
                 EquipmentMovement::create([
                     'equipment_item_id' => $item->id,
                     'booking_id' => $lockedBooking->id,
                     'user_id' => $request->user()->id,
-                    'movement_type' => $damaged ? 'returned_damaged' : 'returned',
+                    'movement_type' => $newDamaged === $delta ? 'returned_damaged' : ($newDamaged > 0 ? 'returned_mixed' : 'returned'),
                     'quantity' => $delta,
                     'condition_before' => $bi->issue_condition,
                     'condition_after' => $condition,
-                    'notes' => $row['return_notes'] ?? null,
+                    'notes' => trim(($row['return_notes'] ?? '').($newDamaged > 0 ? "\\nDamaged units in this return: {$newDamaged}" : '')),
                 ]);
             }
             $complete = $bookingItems->every(fn($bi) =>
