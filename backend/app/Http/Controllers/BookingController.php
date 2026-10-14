@@ -251,7 +251,7 @@ class BookingController extends Controller
                 $cumulative = (int) $row['quantity_returned'];
                 abort_unless($cumulative >= (int) $bi->quantity_returned, 422, 'Returned quantity cannot decrease.');
                 abort_unless($cumulative <= (int) $bi->quantity_issued, 422, 'Cannot return more than issued.');
-                $cumulativeDamaged = (int) ($row['quantity_damaged'] ?? ($row['return_condition'] ?? null) === 'damaged' ? $cumulative : (int) $bi->quantity_damaged);
+                $cumulativeDamaged = (int) ($row['quantity_damaged'] ?? ((($row['return_condition'] ?? null) === 'damaged') ? $cumulative : (int) $bi->quantity_damaged));
                 abort_unless($cumulativeDamaged >= (int) $bi->quantity_damaged && $cumulativeDamaged <= $cumulative, 422, 'Invalid damaged quantity.');
                 abort_unless($cumulativeDamaged - (int) $bi->quantity_damaged <= $cumulative - (int) $bi->quantity_returned, 422, 'Invalid damaged return increment.');
                 $item = $equipment->get($bi->equipment_item_id);
