@@ -13,6 +13,7 @@ class BookingController extends Controller
     public function index(Request $request)
     {
         $q=Booking::with(['items.equipment','requester'])->latest();
+        $q->where('unit_id', $request->user()->unit_id);
         if ($request->user()->role === 'scout') $q->where('requested_by_user_id',$request->user()->id);
         return $q->paginate(100);
     }
@@ -23,9 +24,14 @@ class BookingController extends Controller
             'start_date'=>'required|date','end_date'=>'required|date|after_or_equal:start_date','notes'=>'nullable|string',
             'items'=>'required|array|min:1','items.*.equipment_item_id'=>'required|exists:equipment_items,id','items.*.quantity_requested'=>'required|integer|min:1'
         ]);
+        abort_unless($request->user()->unit_id, 403, 'User has no assigned unit.');
+        $ids = collect($data['items'])->pluck('equipment_item_id');
+        abort_unless($ids->unique()->count() === $ids->count(), 422, 'Duplicate equipment lines are not allowed.');
+        $owned = EquipmentItem::query()->where('unit_id', $request->user()->unit_id)->whereIn('id', $ids)->count();
+        abort_unless($owned === $ids->count(), 403, 'Equipment must belong to your unit.');
         return DB::transaction(function() use($request,$data,$notifier){
             $booking=Booking::create([
-                'unit_id'=>$request->user()->unit_id ?: 1,'requested_by_user_id'=>$request->user()->id,
+                'unit_id'=>$request->user()->unit_id,'requested_by_user_id'=>$request->user()->id,
                 'title'=>$data['title'],'purpose'=>$data['purpose']??null,'section'=>$data['section']??$request->user()->section,
                 'patrol'=>$data['patrol']??$request->user()->patrol,'start_date'=>$data['start_date'],'end_date'=>$data['end_date'],
                 'status'=>'submitted','notes'=>$data['notes']??null
@@ -39,12 +45,26 @@ class BookingController extends Controller
     public function update(Request $request, Booking $booking)
     {
         $this->authorizeOwnerOrStaff($request,$booking);
+        abort_unless(in_array($booking->status, ['draft', 'submitted'], true), 409, 'Only draft or submitted bookings can be edited.');
         $data=$request->validate(['title'=>'sometimes|required|string','purpose'=>'nullable|string','section'=>'nullable|string','patrol'=>'nullable|string','start_date'=>'sometimes|required|date','end_date'=>'sometimes|required|date','notes'=>'nullable|string']);
+        $start = $data['start_date'] ?? $booking->start_date->toDateString();
+        $end = $data['end_date'] ?? $booking->end_date->toDateString();
+        abort_unless($end >= $start, 422, 'End date must not precede start date.');
         $booking->update($data);
         return $booking->fresh('items.equipment');
     }
-    public function destroy(Request $request, Booking $booking){ $this->authorizeOwnerOrStaff($request,$booking); $booking->update(['status'=>'cancelled']); return response()->json(['message'=>'Cancelled']); }
-    public function submit(Booking $booking){ $booking->update(['status'=>'submitted']); return $booking; }
+    public function destroy(Request $request, Booking $booking){
+        $this->authorizeOwnerOrStaff($request,$booking);
+        abort_unless(in_array($booking->status, ['draft', 'submitted', 'approved', 'ready_for_collection'], true), 409, 'Checked-out and completed bookings cannot be cancelled.');
+        $booking->update(['status'=>'cancelled']);
+        return response()->json(['message'=>'Cancelled']);
+    }
+    public function submit(Request $request, Booking $booking){
+        $this->authorizeOwnerOrStaff($request, $booking);
+        abort_unless($booking->status === 'draft', 409, 'Only draft bookings can be submitted.');
+        $booking->update(['status'=>'submitted']);
+        return $booking;
+    }
     public function approve(Request $request, Booking $booking, NotificationService $notifier)
     {
         DB::transaction(function () use ($request, $booking) {
@@ -90,6 +110,8 @@ class BookingController extends Controller
     }
     public function reject(Request $request, Booking $booking, NotificationService $notifier)
     {
+        $this->assertUnit($request, $booking);
+        abort_unless($booking->status === 'submitted', 409, 'Only submitted bookings can be rejected.');
         $data=$request->validate(['reason'=>'nullable|string']);
         $booking->update(['status'=>'rejected','rejected_at'=>now(),'notes'=>trim(($booking->notes ?? '')."\nRejected: ".($data['reason'] ?? 'No reason supplied'))]);
         $notifier->sendToUser($booking->requester,'booking_rejected','Booking Rejected',"Your booking '{$booking->title}' was rejected.".(isset($data['reason'])?' Reason: '.$data['reason']:''),"/bookings/{$booking->id}",['booking_id'=>$booking->id]);
@@ -101,11 +123,18 @@ class BookingController extends Controller
             'collection_date'=>'required|date','collection_time'=>'required','collection_location'=>'nullable|string','collection_instructions'=>'nullable|string',
             'return_date'=>'required|date','return_time'=>'required','return_location'=>'nullable|string','return_instructions'=>'nullable|string','notify'=>'boolean'
         ]);
+        $this->assertUnit($request, $booking);
+        abort_unless(in_array($booking->status, ['approved','ready_for_collection'], true), 409, 'Booking must be approved.');
         $booking->update($data + ['collection_set_by_user_id'=>$request->user()->id,'return_set_by_user_id'=>$request->user()->id,'status'=>'ready_for_collection']);
         if($data['notify'] ?? true) $this->sendLogisticsNotifications($booking->fresh(), $notifier);
         return $booking->fresh('items.equipment');
     }
-    public function notifyLogistics(Booking $booking, NotificationService $notifier){ $this->sendLogisticsNotifications($booking,$notifier); return response()->json(['message'=>'Logistics notifications sent']); }
+    public function notifyLogistics(Request $request, Booking $booking, NotificationService $notifier){
+        $this->assertUnit($request, $booking);
+        abort_unless($booking->status === 'ready_for_collection', 409, 'Set collection and return details first.');
+        $this->sendLogisticsNotifications($booking,$notifier);
+        return response()->json(['message'=>'Logistics notifications sent']);
+    }
     /**
      * Issue approved equipment. The payload quantities represent the FINAL cumulative
      * number issued for each booking item. An item can be issued only once.
@@ -144,6 +173,15 @@ class BookingController extends Controller
                 abort_unless($item !== null && (int) $item->unit_id === (int) $lockedBooking->unit_id, 403);
                 abort_unless(!in_array($item->availability_status, ['maintenance','lost','written_off'], true), 409, 'Equipment is unavailable.');
                 abort_unless($qty <= (int) $item->quantity_available, 409, 'Insufficient stock for '.$item->asset_code);
+                $reservedOther = BookingItem::query()
+                    ->where('equipment_item_id', $item->id)
+                    ->where('booking_id', '!=', $lockedBooking->id)
+                    ->whereHas('booking', fn ($query) => $query
+                        ->whereIn('status', ['approved', 'ready_for_collection'])
+                        ->whereDate('start_date', '<=', $lockedBooking->end_date)
+                        ->whereDate('end_date', '>=', $lockedBooking->start_date))
+                    ->sum('quantity_approved');
+                abort_unless($qty <= (int) $item->quantity_available - (int) $reservedOther, 409, 'Stock reserved by another booking.');
                 $totalIssued += $qty;
             }
             abort_unless($totalIssued > 0, 422, 'Issue at least one item.');
@@ -212,7 +250,8 @@ class BookingController extends Controller
                 $cumulative = (int) $row['quantity_returned'];
                 abort_unless($cumulative >= (int) $bi->quantity_returned, 422, 'Returned quantity cannot decrease.');
                 abort_unless($cumulative <= (int) $bi->quantity_issued, 422, 'Cannot return more than issued.');
-                abort_unless($equipment->has($bi->equipment_item_id), 404);
+                $item = $equipment->get($bi->equipment_item_id);
+                abort_unless($item !== null && (int) $item->unit_id === (int) $lockedBooking->unit_id, 403);
             }
 
             foreach ($bookingItems as $bi) {
@@ -274,6 +313,13 @@ class BookingController extends Controller
         $notifier->sendToUser($booking->requester,'return_date_set','Return Date Confirmed',"Return for '{$booking->title}': {$booking->return_date?->format('Y-m-d')} at {$booking->return_time}. {$booking->return_location}","/bookings/{$booking->id}",['booking_id'=>$booking->id]);
         $booking->update(['collection_notified_at'=>now(),'return_notified_at'=>now()]);
     }
-    private function authorizeView(Request $request, Booking $booking): void { if($request->user()->role==='scout' && $booking->requested_by_user_id!==$request->user()->id) abort(403); }
-    private function authorizeOwnerOrStaff(Request $request, Booking $booking): void { if(in_array($request->user()->role,['admin','qm'],true)) return; if($booking->requested_by_user_id!==$request->user()->id) abort(403); }
+    private function authorizeView(Request $request, Booking $booking): void {
+        $this->assertUnit($request, $booking);
+        if($request->user()->role==='scout' && $booking->requested_by_user_id!==$request->user()->id) abort(403);
+    }
+    private function authorizeOwnerOrStaff(Request $request, Booking $booking): void {
+        $this->assertUnit($request, $booking);
+        if(in_array($request->user()->role,['admin','qm'],true)) return;
+        if($booking->requested_by_user_id!==$request->user()->id) abort(403);
+    }
 }
