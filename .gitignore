@@ -38,3 +38,5 @@ backend/public/storage
 .vscode/
 .DS_Store
 Thumbs.db
+
+/backend/.phpunit.result.cache
